@@ -21,8 +21,10 @@ package org.apache.pulsar.broker.service.persistent;
 import com.google.common.collect.ComparisonChain;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.pulsar.common.util.collections.ConcurrentLongLongPairHashMap;
 import org.apache.pulsar.common.util.collections.ConcurrentLongLongPairHashMap.LongPair;
@@ -31,6 +33,7 @@ import org.apache.pulsar.utils.ConcurrentBitmapSortedLongPairSet;
 public class MessageRedeliveryController {
     private final ConcurrentBitmapSortedLongPairSet messagesToRedeliver;
     private final ConcurrentLongLongPairHashMap hashesToBeBlocked;
+    private final Map<Long, AtomicInteger> stickyKeyHashCountMap;
 
     public MessageRedeliveryController(boolean allowOutOfOrderDelivery) {
         this.messagesToRedeliver = new ConcurrentBitmapSortedLongPairSet();
@@ -38,6 +41,7 @@ public class MessageRedeliveryController {
                 ? null
                 : ConcurrentLongLongPairHashMap
                     .newBuilder().concurrencyLevel(2).expectedItems(128).autoShrink(true).build();
+        this.stickyKeyHashCountMap = new ConcurrentHashMap<>(128);
     }
 
     public void add(long ledgerId, long entryId) {
@@ -47,13 +51,29 @@ public class MessageRedeliveryController {
     public void add(long ledgerId, long entryId, long stickyKeyHash) {
         if (hashesToBeBlocked != null) {
             hashesToBeBlocked.put(ledgerId, entryId, stickyKeyHash, 0);
+
+            AtomicInteger originValue = stickyKeyHashCountMap.putIfAbsent(stickyKeyHash, new AtomicInteger(1));
+            if (originValue != null) {
+                originValue.incrementAndGet();
+            }
         }
         messagesToRedeliver.add(ledgerId, entryId);
     }
 
+    private void removeHashesToBeBlocked(long ledgerId, long entryId) {
+        LongPair longPair = hashesToBeBlocked.get(ledgerId, entryId);
+        hashesToBeBlocked.remove(ledgerId, entryId);
+        if (longPair != null) {
+            int keyCount = stickyKeyHashCountMap.get(longPair.first).decrementAndGet();
+            if (keyCount == 0) {
+                stickyKeyHashCountMap.remove(longPair.first);
+            }
+        }
+    }
+
     public void remove(long ledgerId, long entryId) {
         if (hashesToBeBlocked != null) {
-            hashesToBeBlocked.remove(ledgerId, entryId);
+            removeHashesToBeBlocked(ledgerId, entryId);
         }
         messagesToRedeliver.remove(ledgerId, entryId);
     }
@@ -67,7 +87,7 @@ public class MessageRedeliveryController {
                     keysToRemove.add(new LongPair(ledgerId, entryId));
                 }
             });
-            keysToRemove.forEach(longPair -> hashesToBeBlocked.remove(longPair.first, longPair.second));
+            keysToRemove.forEach(longPair -> removeHashesToBeBlocked(longPair.first, longPair.second));
             keysToRemove.clear();
         }
         messagesToRedeliver.removeUpTo(markDeleteLedgerId, markDeleteEntryId + 1);
@@ -80,6 +100,7 @@ public class MessageRedeliveryController {
     public void clear() {
         if (hashesToBeBlocked != null) {
             hashesToBeBlocked.clear();
+            stickyKeyHashCountMap.clear();
         }
         messagesToRedeliver.clear();
     }
@@ -89,15 +110,14 @@ public class MessageRedeliveryController {
     }
 
     public boolean containsStickyKeyHashes(Set<Integer> stickyKeyHashes) {
-        final AtomicBoolean isContained = new AtomicBoolean(false);
         if (hashesToBeBlocked != null) {
-            hashesToBeBlocked.forEach((ledgerId, entryId, stickyKeyHash, none) -> {
-                if (!isContained.get() && stickyKeyHashes.contains((int) stickyKeyHash)) {
-                    isContained.set(true);
+            for (Integer key : stickyKeyHashes) {
+                if (stickyKeyHashCountMap.containsKey((long) key)) {
+                    return true;
                 }
-            });
+            }
         }
-        return isContained.get();
+        return false;
     }
 
     public Set<PositionImpl> getMessagesToReplayNow(int maxMessagesToRead) {
