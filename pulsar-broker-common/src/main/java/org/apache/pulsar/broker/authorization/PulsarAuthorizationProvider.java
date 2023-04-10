@@ -93,7 +93,18 @@ public class PulsarAuthorizationProvider implements AuthorizationProvider {
     @Override
     public CompletableFuture<Boolean> canProduceAsync(TopicName topicName, String role,
             AuthenticationDataSource authenticationData) {
-        return checkAuthorization(topicName, role, AuthAction.produce);
+        return validateTenantAdminAccess(topicName.getTenant(), role, authenticationData)
+                .thenComposeAsync(isSuperUserOrAdmin -> {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Verify if role {} is allowed to consume topic {}: isSuperUserOrAdmin={}",
+                                role, topicName, isSuperUserOrAdmin);
+                    }
+                    if (isSuperUserOrAdmin) {
+                        return CompletableFuture.completedFuture(true);
+                    } else {
+                        return checkAuthorization(topicName, role, AuthAction.produce);
+                    }
+                });
     }
 
     /**
@@ -110,6 +121,8 @@ public class PulsarAuthorizationProvider implements AuthorizationProvider {
     @Override
     public CompletableFuture<Boolean> canConsumeAsync(TopicName topicName, String role,
             AuthenticationDataSource authenticationData, String subscription) {
+        CompletableFuture<Boolean> isSuperUserOrAdminFuture =
+                validateTenantAdminAccess(topicName.getTenant(), role, authenticationData);
         CompletableFuture<Boolean> permissionFuture = new CompletableFuture<>();
         try {
             pulsarResources.getNamespaceResources().getPoliciesAsync(topicName.getNamespaceObject())
@@ -162,11 +175,26 @@ public class PulsarAuthorizationProvider implements AuthorizationProvider {
                 return null;
             });
         } catch (Exception e) {
-            log.warn("Client  with Role - {} failed to get permissions for topic - {}. {}", role, topicName,
+            log.warn("Client with Role - {} failed to get permissions for topic - {}. {}", role, topicName,
                     e.getMessage());
             permissionFuture.completeExceptionally(e);
         }
-        return permissionFuture;
+
+        return isSuperUserOrAdminFuture.exceptionally(ex -> {
+            log.warn("Client with Role - {} failed to check tenant admin for topic - {}. {}", role, topicName,
+                    ex.getMessage());
+            return false;
+        }).thenComposeAsync(isSuperUserOrAdmin -> {
+            if (log.isDebugEnabled()) {
+                log.debug("Verify if role {} is allowed to consume topic {}: isSuperUserOrAdmin={}",
+                        role, topicName, isSuperUserOrAdmin);
+            }
+            if (isSuperUserOrAdmin) {
+                return CompletableFuture.completedFuture(true);
+            } else {
+                return permissionFuture;
+            }
+        });
     }
 
     /**
