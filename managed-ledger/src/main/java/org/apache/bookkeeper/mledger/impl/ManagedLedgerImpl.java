@@ -33,6 +33,7 @@ import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
 import java.io.IOException;
 import java.time.Clock;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -328,6 +329,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
      */
     @VisibleForTesting
     Map<String, byte[]> createdLedgerCustomMetadata;
+
+    // temporarily save the offloading tasks, each item is <ledgerId, offloadFuture>
+    private volatile List<Map.Entry<Long, CompletableFuture<Void>>> offloadingFutureList;
 
     public ManagedLedgerImpl(ManagedLedgerFactoryImpl factory, BookKeeper bookKeeper, MetaStore store,
             ManagedLedgerConfig config, OrderedScheduler scheduledExecutor,
@@ -2547,7 +2551,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                             + ", total size = {}, already offloaded = {}, to offload = {}",
                     name, toOffload.stream().map(LedgerInfo::getLedgerId).collect(Collectors.toList()),
                     sizeSummed, alreadyOffloadedSize, toOffloadSize);
-            offloadLoop(unlockingPromise, toOffload, PositionImpl.LATEST, Optional.empty());
+            parallelOffload(unlockingPromise, toOffload, PositionImpl.LATEST);
         } else {
             // offloadLoop will complete immediately with an empty list to offload
             log.debug("[{}] Nothing to offload, total size = {}, already offloaded = {}, "
@@ -3152,13 +3156,14 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     callback.offloadComplete(result, ctx);
                 }
             });
-            offloadLoop(promise, ledgersToOffload, firstUnoffloaded, Optional.empty());
+            parallelOffload(promise, ledgersToOffload, firstUnoffloaded);
         } else {
             callback.offloadFailed(
                     new ManagedLedgerException.OffloadInProgressException("Offload operation already running"), ctx);
         }
     }
 
+    @Deprecated
     private void offloadLoop(CompletableFuture<PositionImpl> promise, Queue<LedgerInfo> ledgersToOffload,
             PositionImpl firstUnoffloaded, Optional<Throwable> firstError) {
         State currentState = getState();
@@ -3249,6 +3254,119 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                         }
                     });
         }
+    }
+
+
+    private void parallelOffload(CompletableFuture<PositionImpl> promise, Queue<LedgerInfo> ledgersToOffload,
+                                 PositionImpl firstUnoffloaded) {
+        // mainly the same logic as `offloadLoop`, but parallel offload ledgers
+        State currentState = getState();
+        if (currentState == State.Closed) {
+            promise.completeExceptionally(new ManagedLedgerAlreadyClosedException(
+                    String.format("managed ledger [%s] has already closed", name)));
+            return;
+        }
+        if (currentState == State.Fenced) {
+            promise.completeExceptionally(new ManagedLedgerFencedException(
+                    String.format("managed ledger [%s] is fenced", name)));
+            return;
+        }
+
+        List<Map.Entry<Long, CompletableFuture<Void>>> offloadingFutureList = new ArrayList<>(ledgersToOffload.size());
+        while (!ledgersToOffload.isEmpty()) {
+            LedgerInfo info = ledgersToOffload.poll();
+
+            long ledgerId = info.getLedgerId();
+            UUID uuid = UUID.randomUUID();
+            Map<String, String> extraMetadata = Map.of("ManagedLedgerName", name);
+
+            String driverName = config.getLedgerOffloader().getOffloadDriverName();
+            Map<String, String> driverMetadata = config.getLedgerOffloader().getOffloadDriverMetadata();
+
+            CompletableFuture<Void> offloadFuture =
+                    prepareLedgerInfoForOffloaded(ledgerId, uuid, driverName, driverMetadata)
+                            .thenCompose((ignore) -> getLedgerHandle(ledgerId))
+                            .thenCompose(
+                                    readHandle -> config.getLedgerOffloader().offload(readHandle, uuid, extraMetadata))
+                            .thenCompose((ignore) -> {
+                                return Retries.run(Backoff.exponentialJittered(TimeUnit.SECONDS.toMillis(1),
+                                                        TimeUnit.SECONDS.toHours(1)).limit(10),
+                                                FAIL_ON_CONFLICT,
+                                                () -> completeLedgerInfoForOffloaded(ledgerId, uuid),
+                                                scheduledExecutor, name)
+                                        .whenComplete((ignore2, exception) -> {
+                                            if (exception != null) {
+                                                Throwable e = FutureUtil.unwrapCompletionException(exception);
+                                                if (e instanceof MetaStoreException) {
+                                                    // When a MetaStore exception happens, we can not make sure the
+                                                    // metadata update is failed or not. Because we have a retry on
+                                                    // the connection loss, it is possible to get a BadVersion or other
+                                                    // exception after retrying. So we don't clean up the data if it
+                                                    // has metadata operation exception.
+                                                    log.error(
+                                                            "[{}] Failed to update offloaded metadata for the "
+                                                                    + "ledgerId {}, the offloaded data will not "
+                                                                    + "be cleaned up",
+                                                            name, ledgerId, exception);
+                                                    return;
+                                                } else {
+                                                    log.error("[{}] Failed to offload data for the ledgerId {}, "
+                                                                    + "clean up the offloaded data",
+                                                            name, ledgerId, exception);
+                                                }
+                                                OffloadUtils.cleanupOffloaded(
+                                                        ledgerId, uuid, config,
+                                                        driverMetadata,
+                                                        "Metastore failure", name, scheduledExecutor);
+                                            } else {
+                                                // offload ledger success
+                                                invalidateReadHandle(ledgerId);
+                                            }
+                                        });
+                            });
+            offloadingFutureList.add(new AbstractMap.SimpleEntry<>(ledgerId, offloadFuture));
+        }
+
+        this.offloadingFutureList = offloadingFutureList;
+
+        // join all the offload future together to check whether all complete normally or some throws exception
+        CompletableFuture.allOf(
+                        offloadingFutureList.stream().map(Map.Entry::getValue).toArray(CompletableFuture[]::new))
+                .handle((ignored, ex) -> {
+                    offloadingFutureList.forEach(entry -> {
+                        Long ledgerId = entry.getKey();
+                        CompletableFuture<Void> offloadFuture = entry.getValue();
+                        try {
+                            offloadFuture.get();
+                            if (lastOffloadLedgerId < ledgerId) {
+                                lastOffloadLedgerId = ledgerId;
+                            }
+                        } catch (Exception offloadFutureException) {
+                            // BKNoSuchLedgerExistsException: offloading but the ledger is trimmed
+                            log.warn("{} ledger {} offload failed", name, ledgerId, offloadFutureException);
+                        }
+
+                        if (!offloadFuture.isDone()) {
+                            log.error("{} ledger {} offload not finished, but have to cancel now",
+                                    name, ledgerId);
+                            offloadFuture.cancel(true);
+                        }
+                    });
+
+                    if (ex != null) {
+                        lastOffloadFailureTimestamp = System.currentTimeMillis();
+                        log.warn("[{}] Exception occurred timestamp {} during offload",
+                                name, lastOffloadFailureTimestamp, ex);
+                        promise.completeExceptionally(ex);
+                    } else {
+                        // all offload complete normally
+                        lastOffloadSuccessTimestamp = System.currentTimeMillis();
+                        log.info("[{}] offload timestamp {} succeed", name, lastOffloadSuccessTimestamp);
+                        promise.complete(firstUnoffloaded);
+                    }
+
+                    return null;
+                });
     }
 
     interface LedgerInfoTransformation {
@@ -4365,6 +4483,16 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
         if (this.checkLedgerRollTask != null) {
             this.checkLedgerRollTask.cancel(false);
+        }
+
+        if (offloadingFutureList != null) {
+            offloadingFutureList.forEach((value) -> {
+                CompletableFuture<Void> offloadingFuture = value.getValue();
+                if (!offloadingFuture.isDone()) {
+                    log.info("{} canceling ledger {} offload", name, value.getKey());
+                    offloadingFuture.cancel(true);
+                }
+            });
         }
     }
 
